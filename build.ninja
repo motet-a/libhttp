@@ -11,9 +11,11 @@ rule ld
   description = LD $in
 
 build build/http.o: cc src/http.c
+build build/dict.o: cc src/dict.c
+build build/utils.o: cc src/utils.c
 
 build build/libtest.o: cc test/libtest.c
-build build/libtest: ld build/libtest.o build/http.o
+build build/libtest: ld build/libtest.o build/http.o build/dict.o build/utils.o
 
 build build/server.o: cc test/server.c
-build build/server: ld build/server.o build/http.o
+build build/server: ld build/server.o build/http.o build/dict.o build/utils.o

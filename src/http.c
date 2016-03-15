@@ -1,35 +1,190 @@
 #include "libhttp.h"
 
+#include <assert.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <libmill.h>
 
-/**
- * Returns NULL on error and sets `errno`.
- */
-static char* http_get_line(tcpsock s) {
+char* http_recv_line(tcpsock socket) {
 	char* line = calloc(HTTP_MAX_LINE_LENGTH + 1, 1);
-	if(!*line) {
-		errno = ENOMEM;
+	if(!line) {
 		return NULL;
 	}
 
-	tcprecvuntil(s, line, HTTP_MAX_LINE_LENGTH, "\n", 1, now() + 1000);
+	size_t length = tcprecvuntil(socket, line, HTTP_MAX_LINE_LENGTH,
+								 "\n", 1,
+								 now() + 1000);
 
-	if(errno != 0) {
+	if(errno != 0 || strlen(line) != length) {
 		free(line);
 		return NULL;
 	}
+
 	return line;
 }
 
-bool http_request_parse(http_request_t* req, const char* line) {
+
+
+http_error_t http_version_parse(http_version_t* version,
+								const char** string_pointer) {
+	const char* string = *string_pointer;
+	if(strlen(string) < 3)
+		return HTTP_ERROR_SYNTAX;
+
+	bool valid = (isdigit(string[0]) &&
+				  string[1] == '.' &&
+				  isdigit(string[2]));
+	if(!valid)
+		return HTTP_ERROR_SYNTAX;
+
+	version->maj = string[0] - '0';
+	version->min = string[2] - '0';
+	*string_pointer += 3;
+	return HTTP_OK;
+}
+
+char* http_version_to_string(const http_version_t* version) {
+	char buffer[100];
+	sprintf(buffer, "%u.%u", version->maj, version->min);
+	return strdup(buffer);
+}
+
+
+
+http_error_t http_header_init(http_header_t* header) {
+	http_error_t e = http_dict_init(&header->dict);
+	if(e != HTTP_OK)
+		return e;
+	header->version.min = 1;
+	header->version.maj = 1;
+	return HTTP_OK;
+}
+
+void http_header_dispose(http_header_t* header) {
+	http_dict_dispose(&header->dict);
+}
+
+
+
+static char* request_first_line_to_string(const http_request_t* request) {
+	char* version = http_version_to_string(&request->header.version);
+	if(!version) {
+		return NULL;
+	}
+	size_t size = (strlen(request->method) +
+				   strlen(request->uri) +
+				   strlen(version));
+	char* line = malloc(size + 10);
+	if(!line) {
+		free(version);
+		return NULL;
+	}
+	sprintf(line, "%s %s HTTP/%s", request->method, request->uri, version);
+	free(version);
+	return line;
+}
+
+char* http_request_to_string(const http_request_t* request,
+							 const char* line_ending) {
+	char* first_line = request_first_line_to_string(request);
+	char* dict = http_dict_to_string(&request->header.dict, line_ending);
+	if(!first_line || !dict) {
+		free(first_line);
+		free(dict);
+		return NULL;
+	}
+	char* s = malloc(strlen(first_line) + strlen(dict) +
+					 strlen(line_ending) * 2 + 1);
+	if(s)
+		sprintf(s, "%s%s%s%s", first_line, line_ending, dict, line_ending);
+	free(first_line);
+	free(dict);
+	return s;
+}
+
+static void request_print(const http_request_t* request) {
+	char* s = http_request_to_string(request, "\n");
+	printf("%s", s);
+	free(s);
+}
+
+static http_error_t request_parse_http_version(http_request_t* request,
+											   const char** string_pointer) {
+	if(httpu_skip_string(string_pointer, "HTTP/") != 0)
+		return HTTP_ERROR_SYNTAX;
+	return http_version_parse(&request->header.version, string_pointer);
+}
+
+static http_error_t request_parse_first_line(http_request_t* request,
+											 const char* line) {
+	request->method = httpu_read_until(&line, " ");
+	if(!request->method) {
+		return HTTP_ERROR_SYNTAX;
+	}
+	request->uri = httpu_read_until(&line, " ");
+	if(!request->uri) {
+		free(request->method);
+		return HTTP_ERROR_SYNTAX;
+	}
+
+	http_error_t e = request_parse_http_version(request, &line);
+	if(e != HTTP_OK) {
+		free(request->method);
+		free(request->uri);
+		return HTTP_ERROR_SYNTAX;
+	}
+	return HTTP_OK;
+}
+
+http_error_t http_request_recv(http_request_t* request, tcpsock socket) {
+	char* line = http_recv_line(socket);
+	if(!line) {
+		return HTTP_ERROR_SYNTAX;
+	}
+
+	http_error_t e = http_header_init(&request->header);
+	if(e != HTTP_OK) {
+		free(line);
+		return e;
+	}
+
+	e = request_parse_first_line(request, line);
+	free(line);
+	if(e != HTTP_OK) {
+		http_header_dispose(&request->header);
+		return e;
+	}
+
+	http_dict_t dict;
+	e = http_dict_recv(&dict, socket);
+	if(e != HTTP_OK) {
+		http_header_dispose(&request->header);
+		return e;
+	}
+
+	http_dict_dispose(&request->header.dict);
+	request->header.dict = dict;
+
+	return HTTP_OK;
+}
+
+void http_request_dispose(http_request_t* request) {
+	free(request->method);
+	free(request->uri);
+	http_header_dispose(&request->header);
+}
+
+/*
+static http_error_t request_parse_first_line(http_request_t* request,
+											 const char* line) {
 	bool res = false;
 
 	char* method = 0;
-	size_t szm = httpu_substr_delim(&method, line, 10, " ", 1); // HTTP method must be less than 10 chars long
+	// HTTP method must be less than 10 chars long
+	size_t szm = httpu_substr_delim(&method, line, 10, " ", 1);
 	if(szm == 0 || szm >= 10) {
 		goto exit;
 	}
@@ -37,7 +192,8 @@ bool http_request_parse(http_request_t* req, const char* line) {
 	line += szm + 1;
 
 	char* uri = 0;
-	size_t szu = httpu_substr_delim(&uri, line, 2048, " ", 1); // HTTP URI must be less than 2048 chars long
+	// HTTP URI must be less than 2048 chars long
+	size_t szu = httpu_substr_delim(&uri, line, 2048, " ", 1);
 	if(szu == 0 || szu >= 2048) {
 		goto exit;
 	}
@@ -64,32 +220,6 @@ exit:
 	return res;
 }
 
-void http_request_dispose(http_request_t* req) {
-	free(req->method);
-	free(req->uri);
-
-	for(size_t i = 0; i < req->headers.count; ++i) {
-		free(req->headers.names[i]);
-		free(req->headers.values[i]);
-	}
-
-	free(req->headers.names);
-	free(req->headers.values);
-}
-
-void http_response_init(http_response_t* res, int status) {
-	res->vmaj = 1;
-	res->vmin = 1;
-	res->status = status;
-
-	res->headers.count = 0;
-	res->headers.names = 0;
-	res->headers.values = 0;
-
-	res->body = 0;
-	res->bodylen = 0;
-}
-
 void http_response_format(http_response_t* res, char** buf) {
 	const char* line = "HTTP/%d.%d %d %s\r\n";
 	const char* header = "%s: %s\r\n";
@@ -98,7 +228,6 @@ void http_response_format(http_response_t* res, char** buf) {
 
 	char* lineb = malloc(100);
 	if(!lineb) {
-		errno = ENOMEM;
 		return;
 	}
 
@@ -106,7 +235,6 @@ void http_response_format(http_response_t* res, char** buf) {
 
 	str = calloc(1, strlen(lineb) + 2 + 1);
 	if(!str) {
-		errno = ENOMEM;
 		return;
 	}
 
@@ -152,116 +280,22 @@ void http_response_format(http_response_t* res, char** buf) {
 
 	*buf = str;
 }
+*/
 
-void http_response_dispose(http_response_t* res) {
-	for(size_t i = 0; i < res->headers.count; ++i) {
-		free(*(res->headers.names + i));
-		free(*(res->headers.values + i));
-	}
-
-	free(res->headers.names);
-	free(res->headers.values);
-}
-
-bool http_header_parse(const char* line, char** name, char** value) {
-	ssize_t n = httpu_strlen_delim(line, strlen(line), ":", 1);
-	if(n <= 0) {
-		return false;
-	}
-
-	*name = malloc(n); // Header name must be less than 256 chars long
-	*value = 0;
-	if(!(*name)) {
-		errno = ENOMEM;
-		return false;
-	}
-
-	size_t szn = httpu_substr_delim(name, line, n + 1, ":", 1);
-	if(szn == 0 || szn >= (size_t)n + 1) {
-		return false;
-	}
-
-	line += szn + 2;
-	size_t len = strlen(line);
-
-	if(len <= 0) {
-		return false;
-	}
-
-	*value = calloc(1, len - 1);
-	if(!(*value)) {
-		errno = ENOMEM;
-		return false;
-	}
-
-	memcpy(*value, line, len - 2);
-	return true;
-}
-
-void http_header_add(http_headers_t* hh, char* name, char* value) {
-	hh->count++;
-	hh->names = realloc(hh->names, hh->count * sizeof(char*));
-	hh->values = realloc(hh->values, hh->count * sizeof(char*));
-
-	size_t i = hh->count - 1;
-	*(hh->names + i) = name;
-	*(hh->values + i) = value;
-}
-
-coroutine void client(http_server_t serv, tcpsock s) {
-	while(true) {
-		http_request_t request = {0};
-		http_response_t response = {0};
-
-		http_response_init(&response, 200);
-
-		// Parsing request's first line
-		char* line = http_get_line(s);
-		if(!line) {
-			// TODO: Report error
-			break;
-		}
-
-		if(!http_request_parse(&request, line)) {
-			// TODO: Report error
-			break;
-		}
-
-		free(line);
-
-		// Start parsing headers
-		line = http_get_line(s);
-		while(line && strcmp(line, "\r\n")) {
-			char* name;
-			char* value;
-
-			if(http_header_parse(line, &name, &value)) {
-				http_header_add(&request.headers, name, value);
-
-				free(line);
-				line = http_get_line(s);
-			}
-		}
-		free(line);
-
-		if(serv.onRequest) {
-			serv.onRequest(&request, &response);
-		}
-
-		char* resStr = 0;
-		http_response_format(&response, &resStr);
-
-		tcpsend(s, resStr, strlen(resStr), -1);
-		tcpflush(s, -1);
-
-		free(resStr);
-
-		http_response_dispose(&response);
+coroutine void client(http_server_t serv, tcpsock socket) {
+	http_request_t request;
+	http_error_t e = http_request_recv(&request, socket);
+	if(e != HTTP_OK) {
+		fprintf(stderr, "client(): Error\n");
+	} else {
+		printf("client(): OK\n");
+		request_print(&request);
 		http_request_dispose(&request);
 	}
 }
 
-bool http_listen(http_server_t serv, const char* addrs, int port, int backlog) {
+bool http_listen(http_server_t server, const char* addrs, int port,
+				 int backlog) {
 	ipaddr addr = iplocal(addrs, port, 0);
 	if(errno != 0) {
 		return false;
@@ -273,69 +307,18 @@ bool http_listen(http_server_t serv, const char* addrs, int port, int backlog) {
 	}
 
 	while(true) {
-		tcpsock s = tcpaccept(tcp, -1);
-		if(!s || errno != 0) {
+		tcpsock socket = tcpaccept(tcp, -1);
+		if(!socket || errno != 0) {
 			continue;
 		}
 
-		go(client(serv, s));
+		go(client(server, socket));
 	}
 
 	return true;
 }
 
-// UTILS
-
-ssize_t httpu_strlen_delim(const char* src, size_t len, const char* delims, size_t delimc) {
-	ssize_t i = 0;
-	while(i < (ssize_t)len) {
-		for(size_t j = 0; j < delimc; ++j) {
-			if(*(src + i) == delims[j]) {
-				goto endloop;
-			}
-		}
-
-		++i;
-	}
-
-	if(i == (ssize_t)len) {
-		return -1;
-	}
-
-endloop:
-	return i;
-}
-
-size_t httpu_substr_delim(char** dst, const char* src, size_t len, const char* delims, size_t delimc) {
-	// TODO: Don't allocate that much memory
-	*dst = malloc(len);
-	if(!(*dst)) {
-		errno = ENOMEM;
-		return 0;
-	}
-
-	size_t i = 0;
-	while(i < len) {
-		for(size_t j = 0; j < delimc; ++j) {
-			if(*src == delims[j]) {
-				goto endloop;
-			}
-		}
-
-		*(*dst + i) = *src;
-		++src;
-		++i;
-	}
-
-endloop:
-	if(i < len) {
-		*(*dst + i) = 0;
-	}
-
-	return i;
-}
-
-const char* httpu_status_str(int status) {
+const char* http_get_status_string(int status) {
 	switch(status) {
 		case 100:
 			return "Continue";
